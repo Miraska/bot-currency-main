@@ -9,40 +9,33 @@ import traceback
 from typing import Optional, Dict, Tuple
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
-# Предположим, что config.PROXY_* лежит в utils/config.py
-# Можно поменять импорты под свою структуру.
 from utils.config import config
-
 
 class ParserService:
     """
-    Сервис для парсинга различных курсов (USD, EUR, CNY и т.п.) из ряда источников:
-      - CBR (сегодня/завтра, fallback)
+    Сервис, объединяющий логику парсинга курсов для USD, EUR, CNY:
+      - CBR (с «сегодня/завтра» и fallback на последний известный курс)
+      - Investing (скриншоты + извлечение курса)
+      - ProFinance (с поддержкой прокси)
       - MOEX
-      - ProFinance
-      - Grinex
+      - Grinex (новый источник для USD, USDT/RUB)
       - TradingView
       - XE
       и т.д.
-
-    Использует Playwright (async) для сайтов с динамической загрузкой
-    и requests для некоторых простых запросов (CBR, ABCEX и т.п.).
     """
 
     def __init__(self) -> None:
         """
-        Внутри храним данные CBR для USD/EUR/CNY:
-            self.usd_cbr_data  = {"today_rate": None, "tomorrow_rate": None, "last_cbr_rate": None}
-            self.eur_cbr_data  = {"today_rate": None, "tomorrow_rate": None, "last_cbr_rate": None}
-            self.cny_cbr_data  = {"today_rate": None, "tomorrow_rate": None, "last_cbr_rate": None}
-
-        Также управляем общим Playwright-браузером и прокси.
+        Для каждой валюты храним:
+          - today_rate: курс на сегодня (если дата в XML совпадает с текущей)
+          - tomorrow_rate: курс на завтра (если уже опубликован)
+          - last_cbr_rate: последний доступный курс (на случай, если «сегодня» нет в XML)
         """
         self.usd_cbr_data = {"today_rate": None, "tomorrow_rate": None, "last_cbr_rate": None}
         self.eur_cbr_data = {"today_rate": None, "tomorrow_rate": None, "last_cbr_rate": None}
         self.cny_cbr_data = {"today_rate": None, "tomorrow_rate": None, "last_cbr_rate": None}
 
-        # Список прокси, если нужно
+        # Список прокси, если нужны
         self.proxies = [
             {
                 "server": f"http://{config.PROXY_HOST_1}:{config.PROXY_PORT_1}",
@@ -61,44 +54,24 @@ class ParserService:
             }
         ]
 
+        # Переменные для общего Playwright-браузера (если нужно хранить в едином экземпляре).
+        # Но можно открывать/закрывать их в каждом запросе – зависит от задачи.
         self.playwright = None
         self.browser: Optional[Browser] = None
-        self.context: Optional[BrowserContext] = None
-
 
     # --------------------------------------------------------------------
     # 1. Методы для инициализации / завершения работы с общим браузером
     # --------------------------------------------------------------------
     async def init_browser(self):
         """
-        Запускаем Playwright и Chromium-браузер один раз.
-        Если уже запущен, повторно не создаём.
+        Запускаем Playwright и Chromium-браузер один раз для всего ParserService.
+        Если уже запущено, повторно не создаём.
         """
         if self.playwright is None:
             self.playwright = await async_playwright().start()
 
         if self.browser is None:
             self.browser = await self.playwright.chromium.launch(headless=True)
-
-    async def init_browser_context(self, use_proxy: bool = False):
-        """
-        Создаём единый контекст, который будет использоваться всеми методами.
-        Если нужно — выбираем случайный прокси.
-        """
-        if self.context is None:
-            if use_proxy and self.proxies:
-                chosen_proxy = random.choice(self.proxies)
-                self.context = await self.browser.new_context(proxy=chosen_proxy)
-            else:
-                self.context = await self.browser.new_context()
-
-    async def close_browser_context(self):
-        """
-        Закрываем контекст, если он существует.
-        """
-        if self.context is not None:
-            await self.context.close()
-            self.context = None
 
     async def close_browser(self):
         """
@@ -111,16 +84,16 @@ class ParserService:
             await self.playwright.stop()
             self.playwright = None
 
-
     # ------------------------------------------------------
     # 2. Логика CBR (сегодня / завтра, fallback)
     # ------------------------------------------------------
     def update_cbr_rates_for(self, char_code: str) -> None:
         """
-        Обновляет today_rate/tomorrow_rate/last_cbr_rate для выбранной валюты.
-          - today_rate = курс, если дата в XML совпадает с текущим днём
-          - tomorrow_rate = курс, если уже опубликован завтрашний
-          - last_cbr_rate = последний доступный курс (fallback)
+        Обновляет для выбранной валюты (USD/EUR/CNY) today_rate, tomorrow_rate и last_cbr_rate.
+        Принцип:
+          - Если в XML есть курс на сегодня, пишем в today_rate + last_cbr_rate
+          - Если не совпадает — today_rate=None, last_cbr_rate = (что бы ни пришло)
+          - Пробуем получить курс на завтра; если нет — tomorrow_rate=None
         """
         currency_data = self._get_cbr_data_dict(char_code)
         if not currency_data:
@@ -161,7 +134,7 @@ class ParserService:
 
     def get_cbr_tomorrow_rate(self, char_code: str) -> Optional[str]:
         """
-        Возвращает курс на завтра, если есть, иначе None.
+        Возвращает курс на завтра, если есть. Иначе None.
         """
         currency_data = self._get_cbr_data_dict(char_code)
         if not currency_data:
@@ -170,7 +143,8 @@ class ParserService:
 
     def _get_cbr_data_dict(self, char_code: str) -> Optional[Dict[str, Optional[str]]]:
         """
-        Возвращает ссылку на словарь CBR-данных для char_code (USD/EUR/CNY).
+        Вспомогательный метод, возвращающий ссылку на словарь CBR-данных
+        для выбранного CharCode ('USD', 'EUR', 'CNY').
         """
         if char_code.upper() == "USD":
             return self.usd_cbr_data
@@ -188,8 +162,9 @@ class ParserService:
     ) -> Tuple[Optional[datetime.date], Optional[str]]:
         """
         Запрашивает XML ЦБ (https://www.cbr.ru/scripts/XML_daily.asp).
-        Если date=None, берёт сегодняшний. Возвращает (xml_date, rate_str).
-        Например: ('2025-04-07', '75,32')
+        Если date=None, берём сегодняшний.
+        Возвращает (xml_date, rate_str), где rate_str, например, '75,32'.
+        Если не найден — (None, None).
         """
         try:
             if date:
@@ -218,66 +193,64 @@ class ParserService:
 
             return (xml_date, val_str)
         except Exception as e:
-            print(f"Ошибка CBR {char_code}: {e}")
+            print(f"Ошибка при запросе CBR ({char_code}): {e}")
             return (None, None)
 
-
     # ------------------------------------------------------
-    # 3. MOEX (использует общий контекст)
+    # 3. MOEX
     # ------------------------------------------------------
     async def get_moex_rate(self, url: str, selector: str) -> Optional[str]:
         """
-        Получение курса MOEX, используя общий Playwright-контекст.
+        Простой метод для получения курса с MOEX, используя новый контекст.
         """
         try:
-            if not self.context:
-                print("Не инициализирован контекст браузера (MOEX).")
-                return None
+            await self.init_browser()
+            context = await self.browser.new_context()
+            page = await context.new_page()
 
-            page = await self.context.new_page()
             await page.goto(url, wait_until="domcontentloaded")
-            await page.wait_for_selector(selector, timeout=20000)
+            await page.wait_for_selector(selector, timeout=15000)
             moex_rate = await page.locator(selector).text_content()
 
-            await page.close()
+            await context.close()
             return moex_rate
         except Exception as e:
             print(f"[get_moex_rate] Error: {e}")
             return None
 
-
     # ------------------------------------------------------
-    # 4. PROFINANCE (общий контекст)
+    # 4. PROFINANCE (с прокси)
     # ------------------------------------------------------
     async def get_profinance_rate(self, url: str, selector: str) -> Optional[str]:
         """
-        Получение курса с ProFinance, используя общий контекст.
+        Получение курса с ProFinance, используя случайный прокси в отдельном контексте.
         """
         try:
-            if not self.context:
-                print("Не инициализирован контекст браузера (ProFinance).")
-                return None
+            await self.init_browser()
+            chosen_proxy = random.choice(self.proxies)
+            context = await self.browser.new_context(proxy=chosen_proxy)
+            page = await context.new_page()
 
-            page = await self.context.new_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(5000)  # небольшая пауза на динамическую подгрузку
-            await page.wait_for_selector(selector, state="visible", timeout=20000)
+            await page.wait_for_timeout(5000)  # Ждем для подгрузки динамического контента
+            await page.wait_for_selector(selector, state="visible", timeout=15000)
 
             rate_text = await page.locator(selector).text_content()
-            await page.close()
+
+            await context.close()
             return rate_text
         except Exception as e:
             print(f"[get_profinance_rate] Error: {e}")
             return None
 
-
     # ------------------------------------------------------
-    # 5. ABCEX (requests)
+    # 5. ABCEX (используется только для USD) — requests
     # ------------------------------------------------------
     def get_abcex_rate(self, url: str) -> Optional[str]:
         """
-        Получаем курс (bid price) с ABCEX (JSON).
-        Пример: https://abcex.io/api/v1/exchange/public/market-data/order-book/depth?marketId=USDTRUB&lang=ru
+        Получаем курс (первый bid price) с ABCEX в формате JSON.
+        Пример URL:
+          "https://abcex.io/api/v1/exchange/public/market-data/order-book/depth?marketId=USDTRUB&lang=ru"
         """
         try:
             resp = requests.get(url)
@@ -287,37 +260,52 @@ class ParserService:
                 return str(data["bid"][0]["price"])
             return None
         except Exception as e:
-            print(f"[get_abcex_rate] Error: {e}")
+            print(f"[get_abcex_rate] Ошибка: {e}")
             return None
 
+    # ------------------------------------------------------
+    # 6. GARANTEX (requests), просто оставляем
+    # ------------------------------------------------------
+    def get_garantex_rate(self, market: str) -> Optional[str]:
+        try:
+            url = f"https://garantex.org/api/v2/depth?market={market}"
+            resp = requests.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+
+            if "bids" in data and data["bids"]:
+                return str(data["bids"][0]["price"])
+            return None
+        except Exception as e:
+            print(f"[get_garantex_rate] Error: {e}")
+            return None
 
     # ------------------------------------------------------
-    # 6. TRADING-VIEW (общий контекст)
+    # 7. TRADING-VIEW
     # ------------------------------------------------------
     async def get_tradingview_usd(self, url: str, selector: str) -> Optional[str]:
         """
-        Парсим TradingView, используя общий контекст.
-        Пример: XAUUSD
+        Парсим TradingView, используя новый контекст и случайный прокси.
         """
         try:
-            if not self.context:
-                print("Не инициализирован контекст (TradingView).")
-                return None
+            await self.init_browser()
+            chosen_proxy = random.choice(self.proxies)
+            context = await self.browser.new_context(proxy=chosen_proxy)
+            page = await context.new_page()
 
-            page = await self.context.new_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_selector(selector, state="visible", timeout=20000)
+            await page.wait_for_selector(selector, state="visible", timeout=15000)
 
             rate_text = await page.locator(selector).text_content()
-            await page.close()
+
+            await context.close()
             return rate_text
         except Exception as e:
             print(f"[get_tradingview_usd] Error: {e}")
             return None
 
-
     # ------------------------------------------------------
-    # 7. XE (общий контекст)
+    # 8. Парсеры XE (EUR, CNY) — используем общий браузер с отдельным контекстом
     # ------------------------------------------------------
     async def get_xe_rate_euro_dollar(self) -> Optional[str]:
         """
@@ -351,43 +339,45 @@ class ParserService:
         xpath_selector = '//*[@id="__next"]/div/div[5]/div[2]/div[1]/div[1]/div/div[2]/div[3]/div/div[1]/div[1]/p[2]'
         return await self.fetch_rate(url, xpath_selector, is_xpath=True)
 
-
     # ------------------------------------------------------
-    # 8. GRINEX (для USD USDT/RUB)
+    # 9. Grinex (USD USDT/RUB)
     # ------------------------------------------------------
     async def get_grinex_usd_rate(self) -> Optional[str]:
         """
-        Получаем курс Grinex (USDT/RUB) для USD.
-        Пример: https://grinex.io/trading/usdta7a5
+        Получает курс с сайта Grinex для USD (USDT/RUB).
+        Перед получением курса производится клик по ссылке "#usdta7a5_tab" для переключения вкладки.
+        Если появляется модальное окно (с id "privacy-agree-modal"), пытаемся его закрыть:
+          - Если есть кнопка закрытия, кликаем по ней;
+          - Иначе нажимаем Escape.
+        Затем ждём появления нужного элемента (до 30 секунд) и извлекаем текст.
         """
         selector = "#order_book_holder > div:nth-child(2) > div.bid_orders_panel > table > tbody > tr:nth-child(1) > td.price.col-xs-8.overflow-aut > div"
         try:
-            if not self.context:
-                print("Не инициализирован контекст (Grinex).")
-                return None
-
-            page = await self.context.new_page()
+            await self.init_browser()
+            chosen_proxy = random.choice(self.proxies)
+            context = await self.browser.new_context(proxy=chosen_proxy)
+            page = await context.new_page()
             url = "https://grinex.io/trading/usdta7a5"
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(5000)
 
-            # Закрываем модальное окно (если появилось)
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(5000)  # Доп. ожидание загрузки контента
+
+            # Если появляется модальное окно, пытаемся его закрыть
             try:
-                modal = page.locator("#privacy-agree-modal")
-                if await modal.is_visible(timeout=3000):
-                    close_btn = modal.locator("button[data-action='click->dialog#closeOutside']")
+                if await page.locator("#privacy-agree-modal").is_visible(timeout=5000):
+                    close_btn = page.locator("#privacy-agree-modal button[data-action='click->dialog#closeOutside']")
                     if await close_btn.count() > 0:
-                        await close_btn.first.click(timeout=3000)
+                        await close_btn.first.click(timeout=5000)
                     else:
                         await page.keyboard.press("Escape")
                     await page.wait_for_selector("#privacy-agree-modal", state="hidden", timeout=5000)
-            except:
-                pass
+            except Exception as e:
+                print(f"Ошибка при закрытии модального окна: {e}")
 
-            # Кликаем по вкладке
             await page.click("#usdta7a5_tab", timeout=30000)
             await page.wait_for_timeout(3000)
 
+            # Второй элемент
             element = page.locator(selector).nth(1)
             total_wait = 0
             interval = 500
@@ -402,7 +392,7 @@ class ParserService:
                 raise Exception("Элемент не стал видимым за 30 секунд")
 
             text = await element.text_content()
-            await page.close()
+            await context.close()
 
             value = re.sub(r'[^0-9.,]', '', text).replace(',', '.')
             return value
@@ -410,9 +400,8 @@ class ParserService:
             print(f"[get_grinex_usd_rate] Error: {e}")
             return None
 
-
     # ------------------------------------------------------
-    # 9. Упрощённые методы обновления курсов CBR
+    # 10. Методы обновления курсов CBR в упрощённом варианте
     # ------------------------------------------------------
     def update_usd_cbr_rates(self) -> None:
         self.update_cbr_rates_for("USD")
@@ -423,22 +412,21 @@ class ParserService:
     def update_cny_cbr_rates(self) -> None:
         self.update_cbr_rates_for("CNY")
 
-
     # ------------------------------------------------------
-    # 10. Универсальная fetch_rate (используется в XE)
+    # 11. Универсальная fetch_rate (для XE и т.п.)
     # ------------------------------------------------------
     async def fetch_rate(self, url, selector, is_xpath=False) -> Optional[str]:
         """
-        Заходим на страницу url, ждём появления элемента (CSS или XPath) и берём текст.
-        Три попытки, используя один общий контекст.
+        Переход на страницу url, ожидание по селектору (CSS или XPath) и извлечение inner_text().
+        Берём случайный прокси для каждого запроса. Три попытки (повторяем при ошибках).
         """
-        if not self.context:
-            print("Контекст не инициализирован (fetch_rate).")
-            return None
-
         for attempt in range(3):
             try:
-                page = await self.context.new_page()
+                await self.init_browser()
+                chosen_proxy = random.choice(self.proxies)
+                context = await self.browser.new_context(proxy=chosen_proxy)
+                page = await context.new_page()
+
                 await page.goto(url)
                 await page.wait_for_timeout(5000)
 
@@ -452,15 +440,15 @@ class ParserService:
                 if rate_element:
                     rate_text = await rate_element.inner_text()
                     rate_clean = re.sub(r'[^0-9.,]', '', rate_text).replace(',', '.')
-                    await page.close()
+                    await context.close()
                     return rate_clean
                 else:
                     print(f"Курс не найден по селектору: {selector}")
-                    await page.close()
+                    await context.close()
                     return None
 
             except Exception as e:
-                print(f"[fetch_rate] Ошибка (попытка {attempt + 1}/3): {str(e)}")
+                print(f"Ошибка при получении курса (попытка {attempt + 1}/3): {str(e)}")
                 await asyncio.sleep(2)
 
         return None
