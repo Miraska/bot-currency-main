@@ -1,1 +1,1 @@
-# bot-currency-main
+## Python bot for exchanges

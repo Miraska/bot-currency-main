@@ -1,0 +1,7 @@
+requests
+playwright
+dotenv
+aiogram
+pytz
+reportlab
+tabulate
