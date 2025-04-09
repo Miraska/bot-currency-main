@@ -362,34 +362,22 @@ class ParserService:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(5000)  # Доп. ожидание загрузки контента
 
-            # Если появляется модальное окно, пытаемся его закрыть
-            try:
-                if await page.locator("#privacy-agree-modal").is_visible(timeout=5000):
-                    close_btn = page.locator("#privacy-agree-modal button[data-action='click->dialog#closeOutside']")
-                    if await close_btn.count() > 0:
-                        await close_btn.first.click(timeout=5000)
-                    else:
-                        await page.keyboard.press("Escape")
-                    await page.wait_for_selector("#privacy-agree-modal", state="hidden", timeout=5000)
-            except Exception as e:
-                print(f"Ошибка при закрытии модального окна: {e}")
+            close_btn = page.locator("#privacy-agree-modal button[data-action='click->dialog#closeOutside']")
+
+            if await close_btn.count() > 0:
+                await close_btn.first.click(timeout=5000)
+            else:
+                await page.keyboard.press("Escape")
+
+            await page.wait_for_selector("#privacy-agree-modal", state="hidden", timeout=5000)
+
+            await page.wait_for_timeout(2000)
 
             await page.click("#usdta7a5_tab", timeout=30000)
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(1000)
 
             # Второй элемент
-            element = page.locator(selector).nth(1)
-            total_wait = 0
-            interval = 500
-            max_wait = 30000
-            while total_wait < max_wait:
-                if await element.is_visible():
-                    break
-                await page.wait_for_timeout(interval)
-                total_wait += interval
-
-            if total_wait >= max_wait:
-                raise Exception("Элемент не стал видимым за 30 секунд")
+            element = page.locator(selector).nth(0)
 
             text = await element.text_content()
             await context.close()
