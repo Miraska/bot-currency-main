@@ -187,40 +187,7 @@ async def cmd_usd(message: Message):
     )
     old_table_text = await edit_message_if_changed(wait_msg, table_text, old_table_text)
 
-    # 5. Grinex
-    grinex_rate = await parser_service.get_grinex_usd_rate()
-    table_text = build_currency_table(
-        title="Курсы USD/RUB",
-        investing=invest_rate,
-        cbr_today=cbr_today,
-        cbr_tomorrow=cbr_tomorrow,
-        profinance=profinance_rate,
-        moex=moex_rate,
-        abcex=None,
-        grinex=grinex_rate,
-        tranding_view=None
-    )
-    old_table_text = await edit_message_if_changed(wait_msg, table_text, old_table_text)
-
-    # 6. TradingView
-    tranding_view = await parser_service.get_tradingview_usd(
-        url="https://www.tradingview.com/symbols/XAUUSD/",
-        selector="//span[contains(@class, 'last-JWoJqCpY js-symbol-last')]"
-    )
-    table_text = build_currency_table(
-        title="Курсы USD/RUB",
-        investing=invest_rate,
-        cbr_today=cbr_today,
-        cbr_tomorrow=cbr_tomorrow,
-        profinance=profinance_rate,
-        moex=moex_rate,
-        abcex=None,
-        grinex=grinex_rate,
-        tranding_view=tranding_view
-    )
-    old_table_text = await edit_message_if_changed(wait_msg, table_text, old_table_text)
-
-    # 7. ABCEX (синхронный)
+    # 5. ABCEX (синхронный)
     abcex = None
     try:
         abcex = parser_service.get_abcex_rate(
@@ -237,10 +204,44 @@ async def cmd_usd(message: Message):
         profinance=profinance_rate,
         moex=moex_rate,
         abcex=abcex,
+        grinex=None,
+        tranding_view=None
+    )
+    old_table_text = await edit_message_if_changed(wait_msg, table_text, old_table_text)
+
+    # 6. Grinex
+    grinex_rate = await parser_service.get_grinex_usd_rate()
+    table_text = build_currency_table(
+        title="Курсы USD/RUB",
+        investing=invest_rate,
+        cbr_today=cbr_today,
+        cbr_tomorrow=cbr_tomorrow,
+        profinance=profinance_rate,
+        moex=moex_rate,
+        abcex=abcex,
+        grinex=grinex_rate,
+        tranding_view=None
+    )
+    old_table_text = await edit_message_if_changed(wait_msg, table_text, old_table_text)
+
+    # 7. TradingView
+    tranding_view = await parser_service.get_tradingview_usd(
+        url="https://www.tradingview.com/symbols/XAUUSD/",
+        selector="//span[contains(@class, 'last-JWoJqCpY js-symbol-last')]"
+    )
+    table_text = build_currency_table(
+        title="Курсы USD/RUB",
+        investing=invest_rate,
+        cbr_today=cbr_today,
+        cbr_tomorrow=cbr_tomorrow,
+        profinance=profinance_rate,
+        moex=moex_rate,
+        abcex=abcex,
         grinex=grinex_rate,
         tranding_view=tranding_view
     )
     old_table_text = await edit_message_if_changed(wait_msg, table_text, old_table_text)
+
 
     set_process_state(message.from_user.id, False)
 
